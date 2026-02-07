@@ -143,8 +143,17 @@ func (r *repo) FindByID(ctx context.Context, id uuid.UUID) (*aggregate.Root, err
 ```
 
 ### Ent Schema Rules
-- UUIDv7 primary key: `field.UUID("id", uuid.UUID{}).Default(func() uuid.UUID { id, _ := uuid.NewV7(); return id }).Immutable()`
-- Timestamps via `mixin.Time{}`
+
+**Mandatory Fields — EVERY table MUST have these 3 fields:**
+1. **`id`** — UUIDv7 primary key, immutable: `field.UUID("id", uuid.UUID{}).Default(func() uuid.UUID { id, _ := uuid.NewV7(); return id }).Immutable()`
+2. **`created_at`** — Auto-set on creation, never modified afterward
+3. **`updated_at`** — Auto-updated on every mutation
+
+Add `mixin.Time{}` to every schema's `Mixin()` method. This provides `created_at` and `updated_at` with correct auto-behavior: `created_at` defaults to `time.Now()` at creation and is immutable; `updated_at` defaults to `time.Now()` and auto-updates on every save via ent's `UpdateDefault`.
+
+**No exceptions. A table without `id`, `created_at`, `updated_at` is invalid.**
+
+Other schema rules:
 - Enums: `field.Enum("status").Values(utils.EnumToStrings(vo.GetAllOrderStatuses())...)` -- NEVER hardcode
 - VOs as JSON: `field.JSON("metadata", &vo.OrderMetadata{}).Optional()`
 
@@ -237,7 +246,7 @@ Before submitting any code, verify:
 - [ ] Aggregate roots have no direct attributes (use KeyEntity)
 - [ ] VOs have 3+ fields (otherwise use primitives)
 - [ ] Ent schemas use `utils.EnumToStrings()` for enums, not hardcoded strings
-- [ ] Ent schemas use UUIDv7 and `mixin.Time{}`
+- [ ] **Every** ent schema has UUIDv7 `id` field (immutable) and `mixin.Time{}` for `created_at`/`updated_at`
 - [ ] Repository methods use `withDbClient` pattern
 - [ ] Application layer reads via `RepositoryRead`, writes via Domain Service
 - [ ] API layer is thin -- no business logic

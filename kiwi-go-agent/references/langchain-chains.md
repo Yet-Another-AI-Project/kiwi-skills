@@ -15,7 +15,7 @@ For simple single-shot LLM tasks that do not require loops, tool calls, or multi
 ## Chain Interface
 
 ```go
-// From github.com/tmc/langchaingo/chains
+// From github.com/leeif/langchaingo/chains
 type Chain interface {
     Call(ctx context.Context, inputs map[string]any, options ...ChainCallOption) (map[string]any, error)
     GetMemory() schema.Memory
@@ -63,11 +63,11 @@ import (
     "context"
     _ "embed"
 
-    "github.com/tmc/langchaingo/chains"
-    "github.com/tmc/langchaingo/llms"
-    "github.com/tmc/langchaingo/memory"
-    "github.com/tmc/langchaingo/prompts"
-    "github.com/tmc/langchaingo/schema"
+    "github.com/leeif/langchaingo/chains"
+    "github.com/leeif/langchaingo/llms"
+    "github.com/leeif/langchaingo/memory"
+    "github.com/leeif/langchaingo/prompts"
+    "github.com/leeif/langchaingo/schema"
 
     "myproject/infrastructure/ai/agent/utils"
     "myproject/infrastructure/config"

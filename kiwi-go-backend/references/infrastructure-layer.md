@@ -259,6 +259,18 @@ func (c *clientGetter) withDbClient(
 
 ## Ent Schema Patterns
 
+### Mandatory Fields — EVERY Table
+
+Every ent schema MUST have these 3 fields. No exceptions.
+
+| Field | How | Behavior |
+|-------|-----|----------|
+| `id` | `field.UUID("id", uuid.UUID{}).Default(func() uuid.UUID { id, _ := uuid.NewV7(); return id }).Immutable()` | UUIDv7, auto-generated, immutable after creation |
+| `created_at` | Via `mixin.Time{}` | Auto-set to `time.Now()` on creation, immutable afterward |
+| `updated_at` | Via `mixin.Time{}` | Auto-set to `time.Now()` on creation, auto-updated to `time.Now()` on every mutation via ent's `UpdateDefault` |
+
+**How it works**: `mixin.Time{}` from `entgo.io/ent/schema/mixin` adds both `created_at` and `updated_at` fields with correct defaults and update behavior. You do NOT need to manually set these fields in your repository `Save`/`Update` methods — ent handles it automatically.
+
 ### Full Schema Example
 
 ```go
@@ -327,11 +339,12 @@ func (Order) Edges() []ent.Edge {
 
 ### Key Schema Rules
 
-1. **UUIDv7**: All tables use `uuid.NewV7()` as default ID
-2. **Timestamps**: Always include `mixin.Time{}` for `created_at`/`updated_at`
-3. **Enums**: Use `utils.EnumToStrings(vo.GetAll*())` -- NEVER hardcode strings
-4. **VOs**: Use `field.JSON()` for value objects -- NEVER create separate tables
-5. **Indexes**: Add indexes for common query fields
+1. **MANDATORY**: Every table MUST have `id` (UUIDv7), `created_at`, and `updated_at`. No exceptions.
+2. **UUIDv7**: All tables use `uuid.NewV7()` as default ID, marked `Immutable()`
+3. **Timestamps**: Always include `mixin.Time{}` in `Mixin()` — this provides `created_at` (immutable, set on creation) and `updated_at` (auto-updated on every save)
+4. **Enums**: Use `utils.EnumToStrings(vo.GetAll*())` -- NEVER hardcode strings
+5. **VOs**: Use `field.JSON()` for value objects -- NEVER create separate tables
+6. **Indexes**: Add indexes for common query fields
 
 ## Ent Client
 

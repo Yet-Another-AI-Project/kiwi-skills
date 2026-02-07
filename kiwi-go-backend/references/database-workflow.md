@@ -12,6 +12,8 @@ Define Schema -> Generate Code -> Generate Migration -> Apply Migration
 
 Create or modify schemas in `infrastructure/repository/ent/schema/`.
 
+**Every schema MUST include**: UUIDv7 `id` field + `mixin.Time{}` for `created_at`/`updated_at`. See Infrastructure Layer docs for details.
+
 ```go
 // infrastructure/repository/ent/schema/order.go
 package schema
@@ -33,6 +35,7 @@ type Order struct {
 
 func (Order) Fields() []ent.Field {
     return []ent.Field{
+        // MANDATORY: UUIDv7 primary key (immutable)
         field.UUID("id", uuid.UUID{}).
             Default(func() uuid.UUID { id, _ := uuid.NewV7(); return id }).
             Immutable(),
@@ -46,6 +49,8 @@ func (Order) Fields() []ent.Field {
 }
 
 func (Order) Mixin() []ent.Mixin {
+    // MANDATORY: provides created_at (immutable, set on creation) and
+    // updated_at (auto-updated on every mutation)
     return []ent.Mixin{mixin.Time{}}
 }
 
