@@ -7,10 +7,19 @@ Complete patterns for implementing tools that agents can invoke.
 ```go
 // From golanggraph/prebuilt/node/tools
 type ITool interface {
-    Tools(ctx context.Context) []llms.Tool   // Return tool definitions (JSON Schema)
-    Run(ctx context.Context, currentState *state.State, streamFunc flowcontract.StreamFunc) error
+    Tools(ctx context.Context) []llms.Tool                                          // Return tool definitions (JSON Schema)
+    Run(ctx context.Context, toolCall llms.ToolCall) (llms.ToolCallResponse, error)  // Execute a single tool call
 }
 ```
+
+The `Run` method receives a single `llms.ToolCall` and returns a `llms.ToolCallResponse`. The framework's `ToolsNode` handles:
+- Iterating over all tool calls in the last message
+- Matching each call to the correct `ITool` by function name
+- Running matched tools concurrently via goroutines
+- Appending all `ToolCallResponse` messages to history
+- Returning "Tool not found" for unmatched tool calls
+
+Tools no longer need to manage state, history, or streaming directly.
 
 ## Complete Tool Example: Search Tool
 
@@ -21,14 +30,10 @@ import (
     "context"
     "encoding/json"
 
-    flowcontract "github.com/futurxlab/golanggraph/contract"
-    "github.com/futurxlab/golanggraph/logger"
-    "github.com/futurxlab/golanggraph/state"
-    "github.com/futurxlab/golanggraph/xerror"
+    "github.com/Yet-Another-AI-Project/kiwi-lib/logger"
+    "github.com/Yet-Another-AI-Project/kiwi-lib/xerror"
     "github.com/tmc/langchaingo/llms"
 )
-
-const MetadataKeySearchResults = "search_results"
 
 type SearchTool struct {
     client ISearchClient
@@ -64,84 +69,41 @@ func (t *SearchTool) Tools(ctx context.Context) []llms.Tool {
     }}
 }
 
-// Run executes tool calls found in the last history message
-func (t *SearchTool) Run(ctx context.Context, currentState *state.State, streamFunc flowcontract.StreamFunc) error {
-    if len(currentState.History) == 0 {
-        return nil
+// Run executes a single search tool call
+func (t *SearchTool) Run(ctx context.Context, toolCall llms.ToolCall) (llms.ToolCallResponse, error) {
+    // Parse arguments
+    var args struct {
+        Query      string `json:"query"`
+        MaxResults int    `json:"max_results"`
+    }
+    if err := json.Unmarshal([]byte(toolCall.FunctionCall.Arguments), &args); err != nil {
+        return llms.ToolCallResponse{}, xerror.Wrap(err)
+    }
+    if args.MaxResults <= 0 {
+        args.MaxResults = 5
     }
 
-    lastMsg := currentState.History[len(currentState.History)-1]
+    t.logger.Infof(ctx, "Executing search: query=%s, max_results=%d", args.Query, args.MaxResults)
 
-    for _, part := range lastMsg.Parts {
-        toolCall, ok := part.(llms.ToolCall)
-        if !ok {
-            continue
-        }
-
-        if toolCall.FunctionCall.Name != "search" {
-            continue
-        }
-
-        // Parse arguments
-        var args struct {
-            Query      string `json:"query"`
-            MaxResults int    `json:"max_results"`
-        }
-        if err := json.Unmarshal([]byte(toolCall.FunctionCall.Arguments), &args); err != nil {
-            return xerror.Wrap(err)
-        }
-        if args.MaxResults <= 0 {
-            args.MaxResults = 5
-        }
-
-        t.logger.Infof(ctx, "Executing search: query=%s, max_results=%d", args.Query, args.MaxResults)
-
-        // Execute search
-        results, err := t.client.Search(ctx, args.Query, args.MaxResults)
-        if err != nil {
-            // Return error as tool response (don't fail the agent)
-            currentState.History = append(currentState.History, llms.MessageContent{
-                Role: llms.ChatMessageTypeTool,
-                Parts: []llms.ContentPart{
-                    llms.ToolCallResponse{
-                        ToolCallID: toolCall.ID,
-                        Name:       toolCall.FunctionCall.Name,
-                        Content:    "Error: " + err.Error(),
-                    },
-                },
-            })
-            continue
-        }
-
-        // Store full results in metadata for other nodes
-        currentState.Metadata[MetadataKeySearchResults] = results
-
-        // Build truncated response for history (save context window)
-        response := buildTruncatedResponse(results)
-
-        currentState.History = append(currentState.History, llms.MessageContent{
-            Role: llms.ChatMessageTypeTool,
-            Parts: []llms.ContentPart{
-                llms.ToolCallResponse{
-                    ToolCallID: toolCall.ID,
-                    Name:       toolCall.FunctionCall.Name,
-                    Content:    response,
-                },
-            },
-        })
-
-        // Stream tool event if callback is available
-        if streamFunc != nil {
-            eventData, _ := json.Marshal(map[string]any{
-                "type":   "tool_result",
-                "name":   "search",
-                "result": response,
-            })
-            _ = streamFunc(ctx, &flowcontract.FlowStreamEvent{Chunk: string(eventData)})
-        }
+    // Execute search
+    results, err := t.client.Search(ctx, args.Query, args.MaxResults)
+    if err != nil {
+        // Return error as tool response (don't fail the agent)
+        return llms.ToolCallResponse{
+            ToolCallID: toolCall.ID,
+            Name:       toolCall.FunctionCall.Name,
+            Content:    "Error: " + err.Error(),
+        }, nil
     }
 
-    return nil
+    // Build truncated response for history (save context window)
+    response := buildTruncatedResponse(results)
+
+    return llms.ToolCallResponse{
+        ToolCallID: toolCall.ID,
+        Name:       toolCall.FunctionCall.Name,
+        Content:    response,
+    }, nil
 }
 
 func buildTruncatedResponse(results []SearchResult) string {
@@ -166,12 +128,14 @@ func buildTruncatedResponse(results []SearchResult) string {
     resp := map[string]any{
         "results": truncatedResults,
         "total":   len(results),
-        "note":    "Results are truncated for context efficiency. Full results available in metadata.",
+        "note":    "Results are truncated for context efficiency.",
     }
     data, _ := json.Marshal(resp)
     return string(data)
 }
 ```
+
+> **Note on full results storage**: Since tools no longer have access to `state.State`, store full results via other mechanisms (e.g., a shared repository injected into the tool, or by including sufficient detail in the truncated response). If downstream nodes need full results, consider using a shared data store or encoding essential IDs in the response for later retrieval.
 
 ## File Search Tool (with Response Trimming)
 
@@ -184,17 +148,14 @@ import (
     "context"
     "encoding/json"
 
-    flowcontract "github.com/futurxlab/golanggraph/contract"
-    "github.com/futurxlab/golanggraph/logger"
-    "github.com/futurxlab/golanggraph/state"
-    "github.com/futurxlab/golanggraph/xerror"
+    "github.com/Yet-Another-AI-Project/kiwi-lib/logger"
+    "github.com/Yet-Another-AI-Project/kiwi-lib/xerror"
     "github.com/tmc/langchaingo/llms"
 )
 
 const (
     maxContentCharsPerResult = 500
     maxResultsInResponse     = 4
-    MetadataKeyFileResults   = "file_search_results"
 )
 
 type FileSearchTool struct {
@@ -230,74 +191,53 @@ func (t *FileSearchTool) Tools(ctx context.Context) []llms.Tool {
     }}
 }
 
-func (t *FileSearchTool) Run(ctx context.Context, currentState *state.State, streamFunc flowcontract.StreamFunc) error {
-    if len(currentState.History) == 0 {
-        return nil
+func (t *FileSearchTool) Run(ctx context.Context, toolCall llms.ToolCall) (llms.ToolCallResponse, error) {
+    var args struct {
+        Query     string `json:"query"`
+        SectionID string `json:"section_id"`
+    }
+    if err := json.Unmarshal([]byte(toolCall.FunctionCall.Arguments), &args); err != nil {
+        return llms.ToolCallResponse{}, xerror.Wrap(err)
     }
 
-    lastMsg := currentState.History[len(currentState.History)-1]
-    for _, part := range lastMsg.Parts {
-        toolCall, ok := part.(llms.ToolCall)
-        if !ok || toolCall.FunctionCall.Name != "file_search" {
-            continue
-        }
+    // Execute vector search
+    results, err := t.vectorStore.Search(ctx, args.Query)
+    if err != nil {
+        return llms.ToolCallResponse{
+            ToolCallID: toolCall.ID,
+            Name:       toolCall.FunctionCall.Name,
+            Content:    "Error: " + err.Error(),
+        }, nil
+    }
 
-        var args struct {
-            Query     string `json:"query"`
-            SectionID string `json:"section_id"`
+    // Build TRUNCATED response for history (save context window)
+    truncated := make([]map[string]string, 0, maxResultsInResponse)
+    for i, r := range results {
+        if i >= maxResultsInResponse {
+            break
         }
-        if err := json.Unmarshal([]byte(toolCall.FunctionCall.Arguments), &args); err != nil {
-            return xerror.Wrap(err)
+        content := r.Content
+        if len([]rune(content)) > maxContentCharsPerResult {
+            content = string([]rune(content)[:maxContentCharsPerResult]) + "...[content truncated]"
         }
-
-        // Execute vector search
-        results, err := t.vectorStore.Search(ctx, args.Query)
-        if err != nil {
-            return xerror.Wrap(err)
-        }
-
-        // Store FULL results in metadata (other nodes may need them)
-        if currentState.Metadata == nil {
-            currentState.Metadata = make(map[string]interface{})
-        }
-        currentState.Metadata[MetadataKeyFileResults] = results
-
-        // Build TRUNCATED response for history (save context window)
-        truncated := make([]map[string]string, 0, maxResultsInResponse)
-        for i, r := range results {
-            if i >= maxResultsInResponse {
-                break
-            }
-            content := r.Content
-            if len([]rune(content)) > maxContentCharsPerResult {
-                content = string([]rune(content)[:maxContentCharsPerResult]) + "...[content truncated]"
-            }
-            truncated = append(truncated, map[string]string{
-                "id":      r.ID,
-                "title":   r.Title,
-                "content": content,
-            })
-        }
-
-        response, _ := json.Marshal(map[string]any{
-            "results": truncated,
-            "total":   len(results),
-            "note":    "Results are truncated for context efficiency. To get full content, call again with section_id.",
-        })
-
-        currentState.History = append(currentState.History, llms.MessageContent{
-            Role: llms.ChatMessageTypeTool,
-            Parts: []llms.ContentPart{
-                llms.ToolCallResponse{
-                    ToolCallID: toolCall.ID,
-                    Name:       toolCall.FunctionCall.Name,
-                    Content:    string(response),
-                },
-            },
+        truncated = append(truncated, map[string]string{
+            "id":      r.ID,
+            "title":   r.Title,
+            "content": content,
         })
     }
 
-    return nil
+    response, _ := json.Marshal(map[string]any{
+        "results": truncated,
+        "total":   len(results),
+        "note":    "Results are truncated for context efficiency. To get full content, call again with section_id.",
+    })
+
+    return llms.ToolCallResponse{
+        ToolCallID: toolCall.ID,
+        Name:       toolCall.FunctionCall.Name,
+        Content:    string(response),
+    }, nil
 }
 ```
 
@@ -348,17 +288,36 @@ var JsonReminder = llms.MessageContent{
 
 ## Registering Tools with the Agent
 
+### With Prebuilt Agent (RECOMMENDED)
+
 ```go
-// In agent factory
 searchTool := NewSearchTool(searchClient, logger)
 fileSearchTool := NewFileSearchTool(vectorStore, logger)
 
-// Get all tool definitions for the chat node
+// The prebuilt agent handles tool definitions, tool routing, and max tool calls internally
+a, err := agent.NewAgent(
+    agent.WithName("my_agent"),
+    agent.WithModel(llm),
+    agent.WithTools([]tools.ITool{searchTool, fileSearchTool}),
+    agent.WithMaxToolCalls(6),  // Prevent infinite tool loops
+    agent.WithLogger(logger),
+)
+```
+
+### With Custom Flow (Manual Wiring)
+
+```go
+searchTool := NewSearchTool(searchClient, logger)
+fileSearchTool := NewFileSearchTool(vectorStore, logger)
+
+// Get all tool definitions for the model node
 allToolDefs := append(searchTool.Tools(ctx), fileSearchTool.Tools(ctx)...)
 
 // Create the prebuilt tools node with all tool implementations
 toolsNode, err := tools.NewTools(
     tools.WithTools([]tools.ITool{searchTool, fileSearchTool}),
-    tools.WithMaxToolCalls(6), // Prevent infinite tool loops
 )
+
+// Note: MaxToolCalls is no longer on ToolsNode — use agent.WithMaxToolCalls()
+// or implement a custom hook for max tool call limiting in custom flows
 ```

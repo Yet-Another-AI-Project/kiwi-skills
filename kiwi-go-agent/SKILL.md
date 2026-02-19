@@ -34,10 +34,10 @@ type State struct {
 
 ### Node Interface
 
-Every node implements `contract.INode`:
+Every node implements `flowcontract.Node`:
 
 ```go
-type INode interface {
+type Node interface {
     Name() string
     Run(ctx context.Context, currentState *state.State, streamFunc flowcontract.StreamFunc) error
 }
@@ -46,6 +46,18 @@ type INode interface {
 - `Name()`: Unique identifier used in edge wiring.
 - `Run()`: Executes the node logic. Modifies `currentState` in place.
 - `streamFunc`: Optional callback for streaming events to the caller.
+
+### State Helper Methods
+
+`state.State` provides convenience methods:
+
+```go
+s.GetLastResponse() string          // Last AI message text
+s.GetResumeValue() interface{}      // Value passed via ResumeWithValue()
+s.IsInterrupted() bool              // Whether flow was interrupted
+s.GetThreadID() string              // Current thread ID (for checkpointing)
+s.SetInterruptPayload(payload)      // Set interrupt payload before Interrupt()
+```
 
 ### Edges
 
@@ -98,37 +110,67 @@ finalState, err := compiledFlow.Exec(ctx, initialState, func(ctx context.Context
 
 See [references/agent-examples.md](references/agent-examples.md) for complete code examples of each pattern.
 
-### Pattern 1: Simple ReAct Agent (Prebuilt)
+### Pattern 1: Prebuilt Agent (RECOMMENDED)
 
-Use prebuilt `chat.NewChatNode` + `tools.NewTools` for simple chat-with-tools agents.
+Use `agent.NewAgent()` for all standard chat-with-tools agents. It handles the ReAct loop, tool execution, context compression, and response validation internally.
 
+```go
+a, err := agent.NewAgent(
+    agent.WithName("my_agent"),
+    agent.WithModel(llm),
+    agent.WithTools([]tools.ITool{searchTool, fileTool}),
+    agent.WithMaxToolCalls(10),                              // Prevent infinite loops (default: 10)
+    agent.WithContextWindow(20),                             // Auto-compress history, keep last 20 msgs
+    agent.WithResponseValidator(validatorFunc),               // Optional: validate LLM output
+    agent.WithSubAgent("researcher", researcherAgent),        // Optional: delegate to sub-agents
+    agent.WithBeforeModelHook(beforeHook),                    // Optional: run before LLM call
+    agent.WithAfterModelHook(afterHook),                      // Optional: run after LLM call
+    agent.WithBeforeToolsHook(beforeToolsHook),               // Optional: run before tool execution
+    agent.WithAfterToolsHook(afterToolsHook),                 // Optional: run after tool execution
+    agent.WithLogger(logger),
+)
 ```
-START -> ChatNode -> (has tool calls?) -> ToolsNode -> ChatNode (loop)
-                  -> (no tool calls)  -> END
+
+The prebuilt agent implements `flowcontract.Node`, so it can be used as a node in a larger flow or executed standalone:
+
+```go
+// Standalone execution
+finalState, err := a.Run(ctx, &initialState, streamFunc)
+
+// Or as a node in a flow
+flow.NewFlowBuilder(logger).AddNode(a)...
 ```
 
-Key: Uses `toolcondition.NewToolCondition()` for the conditional edge.
+Key: Replaces manual `ChatNode` + `ToolsNode` + `ToolCondition` wiring. Use this unless you need custom control flow.
 
-### Pattern 2: Custom Agent with Tools
+### Pattern 2: Custom Flow with Manual Wiring (Advanced)
 
-Custom nodes for specialized logic + prebuilt ToolsNode for tool execution.
+Custom nodes for specialized logic + prebuilt `tools.NewTools` + `model.NewModelNode` for manual control. Only use when the prebuilt agent doesn't support your flow requirements.
 
 ```
 START -> CustomGenNode -> (has tool calls?) -> ToolsNode -> CustomGenNode (loop)
                        -> (no tool calls)  -> ValidationNode -> END
 ```
 
-### Pattern 3: Multi-Agent with Roles
+Key: Uses `toolcondition.NewToolCondition()` for the conditional edge. Use `model.NewModelNode` instead of the deprecated `chat.NewChatNode`.
 
-Multiple specialized nodes (e.g., Director + Character) sharing state via Metadata.
+### Pattern 3: Multi-Agent via Delegation (Prebuilt)
 
+Use `agent.WithSubAgent()` to create agents that can delegate tasks to specialized sub-agents. The framework auto-creates a `delegate_task` tool.
+
+```go
+researcher, _ := agent.NewAgent(agent.WithName("researcher"), agent.WithModel(llm), agent.WithTools(researchTools))
+writer, _ := agent.NewAgent(agent.WithName("writer"), agent.WithModel(llm))
+
+orchestrator, _ := agent.NewAgent(
+    agent.WithName("orchestrator"),
+    agent.WithModel(llm),
+    agent.WithSubAgent("researcher", researcher),
+    agent.WithSubAgent("writer", writer),
+)
 ```
-START -> InitNode -> DirectorNode -> (character turn?) -> CharacterNode -> (tool call?) -> ToolsNode -> CharacterNode
-                                  -> (advance shot?)  -> TransitionNode -> DirectorNode (loop)
-                                  -> (done?)          -> END
-```
 
-Key: Each role maintains its own history in Metadata. A coordinator node (Director) routes control.
+The orchestrator LLM receives a `delegate_task` tool with `agent_name` (enum of registered sub-agents) and `task` parameters. Each sub-agent runs with a fresh state containing just the delegated task.
 
 ### Pattern 4: Generation + Validation Loop
 
@@ -143,11 +185,13 @@ START -> GenerationNode -> ValidationNode -> (has errors?) -> FixNode -> Validat
 
 | Component | Import | Purpose |
 |-----------|--------|---------|
-| `chat.NewChatNode` | `golanggraph/prebuilt/node/chat` | Generic LLM chat node |
+| `agent.NewAgent` | `golanggraph/prebuilt/agent` | **RECOMMENDED** All-in-one ReAct agent with tools, hooks, validation, delegation |
+| `model.NewModelNode` | `golanggraph/prebuilt/node/model` | Generic LLM model node (replaces deprecated `chat.NewChatNode`) |
 | `tools.NewTools` | `golanggraph/prebuilt/node/tools` | Executes tool calls from history |
 | `toolcondition.NewToolCondition()` | `golanggraph/prebuilt/edge/toolcondition` | Conditional edge: routes to tools or next node |
 | `native.NewChatLLM` | `golanggraph/prebuilt/langchaingoextension/native` | Creates langchaingo LLM instance |
 | `checkpointer.NewInMemoryCheckpointer()` | `golanggraph/checkpointer` | In-memory state checkpointing |
+| `checkpointer.NewRedisCheckpointer()` | `golanggraph/checkpointer` | Redis-backed state checkpointing (for production) |
 
 ## Tool Implementation
 
@@ -155,10 +199,12 @@ Tools implement `tools.ITool`:
 
 ```go
 type ITool interface {
-    Tools(ctx context.Context) []llms.Tool   // Return tool definitions
-    Run(ctx context.Context, currentState *state.State, streamFunc flowcontract.StreamFunc) error
+    Tools(ctx context.Context) []llms.Tool                                          // Return tool definitions
+    Run(ctx context.Context, toolCall llms.ToolCall) (llms.ToolCallResponse, error)  // Execute a single tool call
 }
 ```
+
+The `Run` method receives a single `llms.ToolCall` and returns a `llms.ToolCallResponse`. The framework's `ToolsNode` handles iterating over tool calls, matching them to the correct tool, and appending responses to history. Tools no longer need to manage state or history directly.
 
 See [references/tools-implementation.md](references/tools-implementation.md) for full tool patterns.
 
@@ -186,21 +232,31 @@ func (t *MyTool) Tools(ctx context.Context) []llms.Tool {
 ### Tool Execution
 
 ```go
-func (t *MyTool) Run(ctx context.Context, currentState *state.State, streamFunc flowcontract.StreamFunc) error {
-    lastMsg := currentState.History[len(currentState.History)-1]
-    for _, part := range lastMsg.Parts {
-        toolCall, ok := part.(llms.ToolCall)
-        if !ok { continue }
-        // Parse arguments, execute, build response
-        result := executeToolCall(toolCall)
-        currentState.History = append(currentState.History, llms.MessageContent{
-            Role: llms.ChatMessageTypeTool,
-            Parts: []llms.ContentPart{
-                llms.ToolCallResponse{ToolCallID: toolCall.ID, Name: toolCall.FunctionCall.Name, Content: result},
-            },
-        })
+func (t *MyTool) Run(ctx context.Context, toolCall llms.ToolCall) (llms.ToolCallResponse, error) {
+    // Parse arguments from the tool call
+    var args struct {
+        Query string `json:"query"`
     }
-    return nil
+    if err := json.Unmarshal([]byte(toolCall.FunctionCall.Arguments), &args); err != nil {
+        return llms.ToolCallResponse{}, xerror.Wrap(err)
+    }
+
+    // Execute tool logic
+    result, err := t.execute(ctx, args.Query)
+    if err != nil {
+        // Return error as tool response (don't fail the agent)
+        return llms.ToolCallResponse{
+            ToolCallID: toolCall.ID,
+            Name:       toolCall.FunctionCall.Name,
+            Content:    "Error: " + err.Error(),
+        }, nil
+    }
+
+    return llms.ToolCallResponse{
+        ToolCallID: toolCall.ID,
+        Name:       toolCall.FunctionCall.Name,
+        Content:    result,
+    }, nil
 }
 ```
 
@@ -294,9 +350,11 @@ See [references/llm-best-practices.md](references/llm-best-practices.md) for det
 
 ### Context Compression (History Trimming)
 
+> **Prebuilt Agent**: Use `agent.WithContextWindow(N)` to enable automatic context compression. The agent's built-in `contextCompressHook` preserves system messages and keeps the last N non-system messages. Manual trimming is only needed for custom flows.
+
 Trim conversation history to stay within context limits while preserving critical messages.
 
-**Sliding Window Pattern** (REQUIRED for long-running agents):
+**Sliding Window Pattern** (REQUIRED for long-running agents with custom flows):
 
 ```go
 func (s *MyState) TrimHistory() {
@@ -419,6 +477,72 @@ MCP provides a standard protocol for LLM-tool communication. In Go agents, MCP i
 
 For MCP server integration, wrap external MCP servers as `tools.ITool` implementations that proxy calls to the MCP server.
 
+## Human-in-the-Loop (Interrupt / Resume)
+
+The framework supports interrupting agent execution to request human input, then resuming with the provided value.
+
+### Interrupting from a Node
+
+Use `flowcontract.Interrupt()` inside a node's `Run()` to pause execution:
+
+```go
+func (n *ApprovalNode) Run(ctx context.Context, currentState *state.State, _ flowcontract.StreamFunc) error {
+    // Prepare payload describing what approval is needed
+    currentState.SetInterruptPayload(map[string]any{
+        "question": "Do you approve this action?",
+        "details":  actionDetails,
+    })
+    return flowcontract.Interrupt(currentState.Metadata["interrupt_payload"])
+}
+```
+
+### Checking for Interrupts
+
+The caller checks whether the flow was interrupted:
+
+```go
+finalState, err := compiledFlow.Exec(ctx, initialState, streamFunc)
+if interruptErr, ok := flowcontract.IsInterrupt(err); ok {
+    // Flow paused — interruptErr.Payload contains the interrupt payload
+    // Present to user, collect input, then resume
+}
+```
+
+### Resuming with a Value
+
+Resume the flow from where it was interrupted by providing the human's response:
+
+```go
+finalState, err := compiledFlow.ResumeWithValue(ctx, threadID, userResponse, streamFunc)
+```
+
+Inside the node, access the resume value via `state.GetResumeValue()`:
+
+```go
+func (n *ApprovalNode) Run(ctx context.Context, currentState *state.State, _ flowcontract.StreamFunc) error {
+    // Check if we're resuming from an interrupt
+    if resumeValue := currentState.GetResumeValue(); resumeValue != nil {
+        approval := resumeValue.(string)
+        if approval == "approved" {
+            // Proceed with the action
+            return nil
+        }
+        // Handle rejection
+        return xerror.New("action rejected by user")
+    }
+
+    // First visit — interrupt for approval
+    currentState.SetInterruptPayload(map[string]any{"question": "Approve?"})
+    return flowcontract.Interrupt(currentState.Metadata["interrupt_payload"])
+}
+```
+
+### Requirements
+
+- A `Checkpointer` MUST be set on the flow for interrupt/resume to work (state is persisted between calls)
+- Use `checkpointer.NewRedisCheckpointer()` for production, `checkpointer.NewInMemoryCheckpointer()` for development
+- `threadID` identifies the conversation thread and is used by the checkpointer to restore state
+
 ## LangChain Chains (Non-Agent)
 
 For simple single-shot LLM tasks (no loops, no tools), use langchaingo chains:
@@ -469,6 +593,8 @@ result := finalState.Metadata[overviewagent.MetadataKeyState].(*MyState)
 
 ## Agent Construction Pattern (Functional Options)
 
+> **Prefer `agent.NewAgent()`** for standard agents. The functional options pattern below is for custom flows or wrapping the prebuilt agent in a domain-specific factory.
+
 Every agent factory follows the functional options pattern:
 
 ```go
@@ -505,15 +631,18 @@ import (
     "github.com/futurxlab/golanggraph/flow"             // flow.NewFlowBuilder, flow.Flow, flow.StartNode, flow.EndNode
     "github.com/futurxlab/golanggraph/edge"             // edge.Edge
     "github.com/futurxlab/golanggraph/state"            // state.State
-    "github.com/futurxlab/golanggraph/checkpointer"     // checkpointer.NewInMemoryCheckpointer()
-    flowcontract "github.com/futurxlab/golanggraph/contract" // StreamFunc, FlowStreamEvent, INode
-    "github.com/futurxlab/golanggraph/logger"           // logger.ILogger
-    "github.com/futurxlab/golanggraph/xerror"           // xerror.Wrap, xerror.New
+    "github.com/futurxlab/golanggraph/checkpointer"     // checkpointer.NewInMemoryCheckpointer(), NewRedisCheckpointer()
+    flowcontract "github.com/futurxlab/golanggraph/contract" // StreamFunc, FlowStreamEvent, Node, Interrupt(), IsInterrupt()
+
+    // kiwi-lib (shared utilities — moved from golanggraph)
+    "github.com/Yet-Another-AI-Project/kiwi-lib/logger" // logger.ILogger
+    "github.com/Yet-Another-AI-Project/kiwi-lib/xerror" // xerror.Wrap, xerror.New
 
     // golanggraph prebuilt
-    "github.com/futurxlab/golanggraph/prebuilt/node/chat"           // chat.NewChatNode
-    "github.com/futurxlab/golanggraph/prebuilt/node/tools"          // tools.NewTools, tools.ITool
-    "github.com/futurxlab/golanggraph/prebuilt/edge/toolcondition"  // toolcondition.NewToolCondition
+    "github.com/futurxlab/golanggraph/prebuilt/agent"              // agent.NewAgent (RECOMMENDED)
+    "github.com/futurxlab/golanggraph/prebuilt/node/model"         // model.NewModelNode (replaces chat.NewChatNode)
+    "github.com/futurxlab/golanggraph/prebuilt/node/tools"         // tools.NewTools, tools.ITool
+    "github.com/futurxlab/golanggraph/prebuilt/edge/toolcondition" // toolcondition.NewToolCondition
 
     // langchaingo
     "github.com/tmc/langchaingo/llms"     // llms.Model, MessageContent, Tool, ToolCall
@@ -543,16 +672,20 @@ var JsonReminder = llms.MessageContent{
 
 Before submitting agent code, verify:
 
-- [ ] All nodes implement `Name()` and `Run()` from `contract.INode`
+- [ ] **Prefer `agent.NewAgent()`** for standard chat-with-tools agents over manual wiring
+- [ ] All custom nodes implement `Name()` and `Run()` from `flowcontract.Node`
 - [ ] Agent factory uses functional options pattern with validation
-- [ ] All `return err` use `xerror.Wrap(err)` (never raw errors)
+- [ ] All `return err` use `xerror.Wrap(err)` (never raw errors) — import from `kiwi-lib/xerror`
 - [ ] Flow starts with `flow.StartNode` and ends with `flow.EndNode`
-- [ ] Long-running agents have history trimming before LLM calls
+- [ ] Long-running agents have history trimming (or use `WithContextWindow()` for prebuilt agents)
 - [ ] Tool responses are truncated in history; full results stored in Metadata
+- [ ] Tool `Run()` uses the new signature: `Run(ctx, llms.ToolCall) (llms.ToolCallResponse, error)`
 - [ ] Prompts use `//go:embed` for templates
 - [ ] Static prompt content is in system messages (cacheable)
 - [ ] Dynamic content is in the last human message
 - [ ] Conditional edges list ALL possible targets in `ConditionalTo`
-- [ ] MaxToolCalls is set to prevent infinite tool loops
+- [ ] MaxToolCalls is set (via `agent.WithMaxToolCalls()` or hook) to prevent infinite tool loops
 - [ ] Streaming events use `streamFunc` with proper nil checks
 - [ ] State is saved to Metadata after mutations in nodes
+- [ ] Human-in-the-Loop flows have a `Checkpointer` set
+- [ ] `logger` and `xerror` are imported from `kiwi-lib`, NOT from `golanggraph`

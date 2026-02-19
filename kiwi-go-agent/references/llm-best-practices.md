@@ -4,6 +4,8 @@ Detailed patterns for optimizing LLM usage in Go agents: context compression, to
 
 ## Context Compression (History Trimming)
 
+> **Prebuilt Agent**: Use `agent.WithContextWindow(N)` to enable automatic context compression. The agent's built-in `contextCompressHook` preserves system messages and keeps the last N non-system messages. The manual patterns below are only needed for custom flows.
+
 Long-running agents accumulate messages that exceed context limits. Trim history before every LLM call in loop-based agents.
 
 ### Sliding Window Pattern
@@ -372,16 +374,16 @@ The standard `ITool` interface is MCP-compatible:
 
 ```go
 type ITool interface {
-    Tools(ctx context.Context) []llms.Tool                           // MCP: list_tools
-    Run(ctx context.Context, st *state.State, sf StreamFunc) error   // MCP: call_tool
+    Tools(ctx context.Context) []llms.Tool                                          // MCP: list_tools
+    Run(ctx context.Context, toolCall llms.ToolCall) (llms.ToolCallResponse, error)  // MCP: call_tool
 }
 ```
 
 The message flow matches MCP:
 1. Agent sends tool definitions to LLM (`Tools()` -> `llms.WithTools()`)
 2. LLM returns tool calls (`llms.ToolCall`)
-3. Agent executes tools (`Run()`)
-4. Agent returns results to LLM (`llms.ToolCallResponse`)
+3. Framework's `ToolsNode` matches and executes tools (`Run()` per tool call)
+4. Framework appends results to LLM history (`llms.ToolCallResponse`)
 
 ### Wrapping External MCP Servers
 
@@ -421,37 +423,24 @@ func (t *MCPProxyTool) Tools(ctx context.Context) []llms.Tool {
     return t.toolDef
 }
 
-func (t *MCPProxyTool) Run(ctx context.Context, currentState *state.State, _ flowcontract.StreamFunc) error {
-    lastMsg := currentState.History[len(currentState.History)-1]
-    for _, part := range lastMsg.Parts {
-        toolCall, ok := part.(llms.ToolCall)
-        if !ok {
-            continue
-        }
-
-        // Proxy the call to the MCP server
-        result, err := t.client.CallTool(ctx, toolCall.FunctionCall.Name, toolCall.FunctionCall.Arguments)
-        if err != nil {
-            result = "Error: " + err.Error()
-        }
-
-        // Truncate result for history
-        if len([]rune(result)) > maxToolResponseChars {
-            result = string([]rune(result)[:maxToolResponseChars]) + "...[truncated]"
-        }
-
-        currentState.History = append(currentState.History, llms.MessageContent{
-            Role: llms.ChatMessageTypeTool,
-            Parts: []llms.ContentPart{
-                llms.ToolCallResponse{
-                    ToolCallID: toolCall.ID,
-                    Name:       toolCall.FunctionCall.Name,
-                    Content:    result,
-                },
-            },
-        })
+func (t *MCPProxyTool) Run(ctx context.Context, toolCall llms.ToolCall) (llms.ToolCallResponse, error) {
+    // Proxy the call to the MCP server
+    result, err := t.client.CallTool(ctx, toolCall.FunctionCall.Name, toolCall.FunctionCall.Arguments)
+    if err != nil {
+        result = "Error: " + err.Error()
     }
-    return nil
+
+    // Truncate result for history
+    const maxToolResponseChars = 1500
+    if len([]rune(result)) > maxToolResponseChars {
+        result = string([]rune(result)[:maxToolResponseChars]) + "...[truncated]"
+    }
+
+    return llms.ToolCallResponse{
+        ToolCallID: toolCall.ID,
+        Name:       toolCall.FunctionCall.Name,
+        Content:    result,
+    }, nil
 }
 ```
 
@@ -469,4 +458,5 @@ func (t *MCPProxyTool) Run(ctx context.Context, currentState *state.State, _ flo
 - For external MCP servers, create a thin proxy `ITool` that translates calls
 - Cache MCP tool definitions at init time (`NewMCPProxyTool`) to avoid repeated `list_tools` calls
 - Apply the same response trimming rules to MCP tool results as to native tools
-- Handle MCP server errors gracefully: return error as tool response content, do not crash the agent
+- Handle MCP server errors gracefully: return error as tool response content (in the `ToolCallResponse`), do not crash the agent
+- The `Run()` method receives a single `llms.ToolCall` and returns a `llms.ToolCallResponse` — the framework handles history management
